@@ -7,6 +7,23 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::Instant;
 
+// Helper function to format numbers with commas
+fn format_number(n: u64) -> String {
+    let s = n.to_string();
+    let mut result = String::new();
+    let mut count = 0;
+
+    for c in s.chars().rev() {
+        if count > 0 && count % 3 == 0 {
+            result.insert(0, ',');
+        }
+        result.insert(0, c);
+        count += 1;
+    }
+
+    result
+}
+
 pub fn main() -> iced::Result {
     Sha256Cracker::run(Settings {
         window: iced::window::Settings {
@@ -344,9 +361,46 @@ impl Application for Sha256Cracker {
             text("").size(14)
         };
 
-        let attempts_text = text(format!("Attempts: {}", self.attempts_count)).size(16);
+        // Calculate total combinations
+        let min_len = self.min_length.parse::<usize>().unwrap_or(1);
+        let max_len = self.max_length.parse::<usize>().unwrap_or(6);
+        let charset_size = (if self.include_lowercase { 26 } else { 0 }
+            + if self.include_uppercase { 26 } else { 0 }
+            + if self.include_numbers { 10 } else { 0 }
+            + if self.include_symbols { 29 } else { 0 }) as u64;
 
-        let hash_rate_text = if self.hashes_per_second > 1_000_000.0 {
+        let mut total_combinations = 0u64;
+        for length in min_len..=max_len {
+            if let Some(combinations) = charset_size.checked_pow(length as u32) {
+                total_combinations = total_combinations.saturating_add(combinations);
+            } else {
+                total_combinations = u64::MAX;
+                break;
+            }
+        }
+
+        let attempts_text = if total_combinations == u64::MAX {
+            text(format!(
+                "Attempts: {} / ∞",
+                format_number(self.attempts_count)
+            ))
+            .size(16)
+        } else {
+            text(format!(
+                "Attempts: {} / {}",
+                format_number(self.attempts_count),
+                format_number(total_combinations)
+            ))
+            .size(16)
+        };
+
+        let hash_rate_text = if self.hashes_per_second > 1_000_000_000.0 {
+            text(format!(
+                "Hash rate: {:.2} GH/s",
+                self.hashes_per_second / 1_000_000_000.0
+            ))
+            .size(16)
+        } else if self.hashes_per_second > 1_000_000.0 {
             text(format!(
                 "Hash rate: {:.2} MH/s",
                 self.hashes_per_second / 1_000_000.0
@@ -364,27 +418,6 @@ impl Application for Sha256Cracker {
 
         // Calculate estimated time
         let estimated_time_text = if self.is_cracking && self.hashes_per_second > 0.0 {
-            // Parse lengths for calculation
-            let min_len = self.min_length.parse::<usize>().unwrap_or(1);
-            let max_len = self.max_length.parse::<usize>().unwrap_or(6);
-
-            // Calculate total combinations for sequential search
-            let charset_size = (if self.include_lowercase { 26 } else { 0 }
-                + if self.include_uppercase { 26 } else { 0 }
-                + if self.include_numbers { 10 } else { 0 }
-                + if self.include_symbols { 29 } else { 0 }) as u64;
-
-            let mut total_combinations = 0u64;
-            for length in min_len..=max_len {
-                if let Some(combinations) = charset_size.checked_pow(length as u32) {
-                    total_combinations = total_combinations.saturating_add(combinations);
-                } else {
-                    // Overflow - use max value
-                    total_combinations = u64::MAX;
-                    break;
-                }
-            }
-
             let remaining = total_combinations.saturating_sub(self.attempts_count);
             let seconds_remaining = remaining as f64 / self.hashes_per_second;
 

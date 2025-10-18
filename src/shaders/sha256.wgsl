@@ -74,15 +74,16 @@ fn get_k(i: u32) -> u32 {
 // Input/Output buffers
 struct SearchParams {
     target_hash: array<u32, 8>,  // Target SHA256 hash (8 x 32-bit words)
-    start_index: u32,              // Starting index for this batch
     batch_size: u32,               // Number of hashes to compute
     charset_size: u32,             // Size of character set
     string_length: u32,            // Current string length being tested
+    batch_offset_low: u32,         // Lower 32 bits of batch offset
+    batch_offset_high: u32,        // Upper 32 bits of batch offset
 }
 
 @group(0) @binding(0) var<storage, read> params: SearchParams;
 @group(0) @binding(1) var<storage, read> charset: array<u32>;  // Character set as u32 array
-@group(0) @binding(2) var<storage, read_write> results: array<u32>;  // Results: [found_flag, index, hash...]
+@group(0) @binding(2) var<storage, read_write> results: array<u32>;  // Results: [found_flag, idx_low, idx_high, hash...]
 
 // Right rotate
 fn rotr(x: u32, n: u32) -> u32 {
@@ -188,10 +189,63 @@ fn sha256_hash(msg_len: u32, w0: u32, w1: u32, w2: u32, w3: u32, w4: u32, w5: u3
     return array<u32, 8>(h0, h1, h2, h3, h4, h5, h6, h7);
 }
 
-// Convert index to message and return as 16 u32 words with padding
-fn index_to_padded_message(idx: u32, length: u32, charset_size: u32) -> array<u32, 16> {
+// 64-bit addition (returns low, high)
+fn add_u64(a_low: u32, a_high: u32, b_low: u32, b_high: u32) -> vec2<u32> {
+    let sum_low = a_low + b_low;
+    let carry = select(0u, 1u, sum_low < a_low);
+    let sum_high = a_high + b_high + carry;
+    return vec2<u32>(sum_low, sum_high);
+}
+
+// 64-bit modulo by u32 divisor (returns remainder)
+fn mod_u64(low: u32, high: u32, divisor: u32) -> u32 {
+    if (high == 0u) {
+        return low % divisor;
+    }
+
+    // Calculate (high * 2^32 + low) % divisor
+    // First: (high % divisor) * (2^32 % divisor) + (low % divisor)
+    let high_mod = high % divisor;
+    let low_mod = low % divisor;
+
+    // (2^32) % divisor = (4294967296 % divisor)
+    // We compute this as: (-divisor) % divisor = 0, then adjust
+    // Actually: 2^32 mod divisor = ((2^16 mod divisor) * (2^16 mod divisor)) mod divisor
+    let base = 65536u % divisor;
+    let base_squared = (base * base) % divisor;
+
+    let result = (((high_mod * base_squared) % divisor) + low_mod) % divisor;
+    return result;
+}
+
+// 64-bit division by u32 divisor (returns quotient as low, high)
+fn div_u64(low: u32, high: u32, divisor: u32) -> vec2<u32> {
+    if (high == 0u) {
+        return vec2<u32>(low / divisor, 0u);
+    }
+
+    // Divide high part
+    let high_quot = high / divisor;
+    let high_rem = high % divisor;
+
+    // Combine remainder with low part and divide
+    // This is tricky: (high_rem * 2^32 + low) / divisor
+    // We split into upper and lower 16 bits
+    let upper = (high_rem << 16u) | (low >> 16u);
+    let upper_quot = upper / divisor;
+    let upper_rem = upper % divisor;
+
+    let lower = (upper_rem << 16u) | (low & 0xFFFFu);
+    let lower_quot = lower / divisor;
+
+    return vec2<u32>((upper_quot << 16u) | lower_quot, high_quot);
+}
+
+// Convert 64-bit index to message and return as 16 u32 words with padding
+fn index_to_padded_message(idx_low: u32, idx_high: u32, length: u32, charset_size: u32) -> array<u32, 16> {
     var result: array<u32, 16>;
-    var temp_idx = idx;
+    var temp_low = idx_low;
+    var temp_high = idx_high;
 
     // Initialize all to zero
     for (var i = 0u; i < 16u; i++) {
@@ -200,7 +254,7 @@ fn index_to_padded_message(idx: u32, length: u32, charset_size: u32) -> array<u3
 
     // Generate string bytes and pack into u32s (big-endian)
     for (var i = 0u; i < length; i++) {
-        let char_idx = temp_idx % charset_size;
+        let char_idx = mod_u64(temp_low, temp_high, charset_size);
         let byte_val = charset[char_idx];
 
         let word_idx = i / 4u;
@@ -209,7 +263,9 @@ fn index_to_padded_message(idx: u32, length: u32, charset_size: u32) -> array<u3
 
         result[word_idx] = result[word_idx] | (byte_val << shift);
 
-        temp_idx = temp_idx / charset_size;
+        let div_result = div_u64(temp_low, temp_high, charset_size);
+        temp_low = div_result.x;
+        temp_high = div_result.y;
     }
 
     // Add padding bit
@@ -246,11 +302,13 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         return;
     }
 
-    // Calculate the actual index to test
-    let test_index = params.start_index + idx;
+    // Calculate the absolute index to test by adding batch offset (64-bit)
+    let sum = add_u64(params.batch_offset_low, params.batch_offset_high, idx, 0u);
+    let absolute_idx_low = sum.x;
+    let absolute_idx_high = sum.y;
 
     // Convert index to message with padding
-    let message = index_to_padded_message(test_index, params.string_length, params.charset_size);
+    let message = index_to_padded_message(absolute_idx_low, absolute_idx_high, params.string_length, params.charset_size);
 
     // Compute SHA256 hash
     let hash = sha256_hash(
@@ -275,16 +333,17 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // If found, store result (atomic would be better but not critical for first match)
     if (matches) {
         results[0] = 1u;  // Found flag
-        results[1] = test_index;  // Store the index that matched
+        results[1] = absolute_idx_low;  // Store the matched index (low 32 bits)
+        results[2] = absolute_idx_high;  // Store the matched index (high 32 bits)
 
         // Store the hash for verification
-        results[2] = hash[0];
-        results[3] = hash[1];
-        results[4] = hash[2];
-        results[5] = hash[3];
-        results[6] = hash[4];
-        results[7] = hash[5];
-        results[8] = hash[6];
-        results[9] = hash[7];
+        results[3] = hash[0];
+        results[4] = hash[1];
+        results[5] = hash[2];
+        results[6] = hash[3];
+        results[7] = hash[4];
+        results[8] = hash[5];
+        results[9] = hash[6];
+        results[10] = hash[7];
     }
 }

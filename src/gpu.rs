@@ -147,17 +147,18 @@ pub fn crack_hash_gpu(
     let mut total_attempts = 0u64;
     let mut last_update_time = Instant::now();
 
-    const BATCH_SIZE: u32 = 1024 * 256; // Process 256K hashes per batch
+    const BATCH_SIZE: u32 = 1024 * 1024; // Process 1M hashes per batch
 
     // Iterate through each length
     for current_length in min_length..=max_length {
+        // Calculate total combinations for this length (must use u64 to avoid overflow)
+        let total_for_length = (charset_size as u64).pow(current_length as u32);
+
         let _ = update_tx.send(WorkerUpdate::Progress {
             current_attempt: format!("GPU searching length {}...", current_length),
             attempts_count: total_attempts,
         });
 
-        // Calculate total combinations for this length
-        let total_for_length = charset_size.pow(current_length as u32) as u64;
         let mut start_index = 0u64;
 
         while start_index < total_for_length {
@@ -166,15 +167,24 @@ pub fn crack_hash_gpu(
                 return;
             }
 
-            let batch_size = BATCH_SIZE.min((total_for_length - start_index) as u32);
+            let remaining = total_for_length - start_index;
+            let batch_size = if remaining > BATCH_SIZE as u64 {
+                BATCH_SIZE
+            } else {
+                remaining as u32
+            };
 
-            // Create params buffer
+            // Create params buffer (with 64-bit batch offset)
+            let offset_low = (start_index & 0xFFFFFFFF) as u32;
+            let offset_high = (start_index >> 32) as u32;
+
             let params_data = SearchParams {
                 target_hash: target_hash_bytes,
-                start_index: start_index as u32,
                 batch_size,
                 charset_size,
                 string_length: current_length as u32,
+                batch_offset_low: offset_low,
+                batch_offset_high: offset_high,
             };
 
             let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -183,8 +193,8 @@ pub fn crack_hash_gpu(
                 usage: wgpu::BufferUsages::STORAGE,
             });
 
-            // Create results buffer (10 u32s: [found_flag, index, hash[8]])
-            let results_data = vec![0u32; 10];
+            // Create results buffer (11 u32s: [found_flag, idx_low, idx_high, hash[8]])
+            let results_data = vec![0u32; 11];
             let results_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("Results Buffer"),
                 contents: bytemuck::cast_slice(&results_data),
@@ -261,15 +271,24 @@ pub fn crack_hash_gpu(
 
             // Check if found
             if results[0] == 1 {
-                let found_index = results[1] as u64;
+                // Reconstruct 64-bit index from low and high parts
+                let found_index = (results[1] as u64) | ((results[2] as u64) << 32);
                 let found_string = index_to_string(found_index, current_length, &charset);
 
-                let _ = update_tx.send(WorkerUpdate::Found {
-                    match_string: found_string,
-                    attempts_count: total_attempts + found_index,
-                });
+                // Verify the match on CPU
+                use sha2::{Digest, Sha256};
+                let mut hasher = Sha256::new();
+                hasher.update(found_string.as_bytes());
+                let result = hasher.finalize();
+                let cpu_hash = format!("{:x}", result);
 
-                return;
+                if cpu_hash == target_hash {
+                    let _ = update_tx.send(WorkerUpdate::Found {
+                        match_string: found_string,
+                        attempts_count: total_attempts + (found_index - start_index),
+                    });
+                    return;
+                }
             }
 
             drop(data);
@@ -280,10 +299,13 @@ pub fn crack_hash_gpu(
 
             // Send progress update every 100ms
             if last_update_time.elapsed().as_millis() >= 100 {
-                let candidate =
-                    index_to_string(start_index.saturating_sub(1), current_length, &charset);
+                let candidate = if start_index > 0 {
+                    index_to_string(start_index - 1, current_length, &charset)
+                } else {
+                    String::from("")
+                };
                 let _ = update_tx.send(WorkerUpdate::Progress {
-                    current_attempt: candidate,
+                    current_attempt: format!("[GPU len={}] {}", current_length, candidate),
                     attempts_count: total_attempts,
                 });
                 last_update_time = Instant::now();
@@ -291,7 +313,7 @@ pub fn crack_hash_gpu(
         }
     }
 
-    // No match found
+    // No match found after searching all lengths
     let _ = update_tx.send(WorkerUpdate::Progress {
         current_attempt: String::from("GPU search completed - no match found"),
         attempts_count: total_attempts,
@@ -302,10 +324,11 @@ pub fn crack_hash_gpu(
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct SearchParams {
     target_hash: [u32; 8],
-    start_index: u32,
     batch_size: u32,
     charset_size: u32,
     string_length: u32,
+    batch_offset_low: u32,
+    batch_offset_high: u32,
 }
 
 fn hex_to_u32_array(hex: &str) -> Result<[u32; 8], ()> {

@@ -2,7 +2,7 @@
 
 A GUI-based SHA-256 hash cracker with both CPU and GPU acceleration support built with Rust and iced.
 
-Includes GPU support! I get around 5MH/s on my CPU and just over 500MH/s on my 4060 Ti.
+Includes GPU support! I get around 5MH/s on my CPU and around 750MH/s on my 4060 Ti.
 
 ## Usage
 Clone the Github repo and run the usual Rust commands:
