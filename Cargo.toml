@@ -11,3 +11,6 @@ tokio = { version = "1", features = ["time"] }
 sha2 = "0.10"
 rand = "0.8"
 rustc-hash = "2.0"
+wgpu = "0.19"
+bytemuck = { version = "1.14", features = ["derive"] }
+pollster = "0.3"

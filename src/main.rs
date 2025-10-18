@@ -1,3 +1,5 @@
+mod gpu;
+
 use iced::widget::{button, checkbox, column, container, text, text_input};
 use iced::{Alignment, Application, Command, Element, Length, Settings, Size, Subscription, Theme};
 use sha2::{Digest, Sha256};
@@ -35,6 +37,7 @@ struct Sha256Cracker {
     include_symbols: bool,
     min_length: String,
     max_length: String,
+    use_gpu: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -49,15 +52,16 @@ enum Message {
     ToggleSymbols(bool),
     MinLengthChanged(String),
     MaxLengthChanged(String),
+    ToggleGPU(bool),
 }
 
 #[derive(Debug, Clone)]
-enum WorkerCommand {
+pub enum WorkerCommand {
     Stop,
 }
 
 #[derive(Debug, Clone)]
-enum WorkerUpdate {
+pub enum WorkerUpdate {
     Progress {
         current_attempt: String,
         attempts_count: u64,
@@ -94,6 +98,7 @@ impl Application for Sha256Cracker {
                 include_symbols: false,
                 min_length: String::from("1"),
                 max_length: String::from("6"),
+                use_gpu: false,
             },
             Command::none(),
         )
@@ -125,6 +130,9 @@ impl Application for Sha256Cracker {
             }
             Message::MaxLengthChanged(value) => {
                 self.max_length = value;
+            }
+            Message::ToggleGPU(value) => {
+                self.use_gpu = value;
             }
             Message::StartCracking => {
                 if self.target_hash.len() != 64 {
@@ -191,10 +199,15 @@ impl Application for Sha256Cracker {
                 let (worker_tx, worker_rx) = mpsc::channel();
                 self.worker_sender = Some(worker_tx);
 
-                // Spawn worker thread
+                // Spawn worker thread (CPU or GPU)
                 let target = self.target_hash.clone();
+                let use_gpu = self.use_gpu;
                 thread::spawn(move || {
-                    crack_hash_worker(target, charset, min_len, max_len, worker_rx);
+                    if use_gpu {
+                        crack_hash_worker_gpu(target, charset, min_len, max_len, worker_rx);
+                    } else {
+                        crack_hash_worker(target, charset, min_len, max_len, worker_rx);
+                    }
                 });
             }
             Message::StopCracking => {
@@ -270,11 +283,15 @@ impl Application for Sha256Cracker {
         let symbols_option =
             checkbox("Symbols (!@#$...)", self.include_symbols).on_toggle(Message::ToggleSymbols);
 
+        let gpu_option =
+            checkbox("Use GPU (Experimental)", self.use_gpu).on_toggle(Message::ToggleGPU);
+
         let options_row = column![
             lowercase_option,
             uppercase_option,
             numbers_option,
             symbols_option,
+            gpu_option,
         ]
         .spacing(5)
         .padding(5);
@@ -433,7 +450,7 @@ static WORKER_CHANNEL: std::sync::OnceLock<(
     std::sync::Mutex<Receiver<WorkerUpdate>>,
 )> = std::sync::OnceLock::new();
 
-fn get_worker_channel() -> &'static (
+pub fn get_worker_channel() -> &'static (
     Sender<WorkerUpdate>,
     std::sync::Mutex<Receiver<WorkerUpdate>>,
 ) {
@@ -559,4 +576,15 @@ fn crack_hash_worker(
         current_attempt: String::from("Search completed - no match found"),
         attempts_count: attempts,
     });
+}
+
+// GPU-accelerated worker
+fn crack_hash_worker_gpu(
+    target_hash: String,
+    charset: String,
+    min_length: usize,
+    max_length: usize,
+    cmd_rx: Receiver<WorkerCommand>,
+) {
+    gpu::crack_hash_gpu(target_hash, charset, min_length, max_length, cmd_rx);
 }
